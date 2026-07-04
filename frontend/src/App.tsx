@@ -49,6 +49,29 @@ type AnalyzeResponse = {
   tags: string[];
 };
 
+type BackendEntity = {
+  id: string;
+  title: string;
+  type: string;
+  description?: string | null;
+};
+
+type BackendRelation = {
+  source: string;
+  target: string;
+  type: string;
+};
+
+type BackendAnalyzeResponse = {
+  mode: string;
+  filename: string;
+  summary: string;
+  entities: BackendEntity[];
+  relations: BackendRelation[];
+  tags: string[];
+  textPreview: string;
+};
+
 type ProcessedFile = {
   id: string;
   name: string;
@@ -70,6 +93,8 @@ type NavigatorItem = {
   badge: string;
   filter?: string;
 };
+
+const API_URL = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8000";
 
 const pages: { key: Page; label: string; icon: string }[] = [
   { key: "home", label: "Главная", icon: "⌂" },
@@ -280,15 +305,110 @@ function cleanGraph(graph: AnalyzeResponse["graph"]) {
   };
 }
 
+function formatFileSize(bytes: number) {
+  if (!bytes) return "0 Б";
+
+  const units = ["Б", "КБ", "МБ", "ГБ"];
+  let size = bytes;
+  let unitIndex = 0;
+
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+
+  return `${size.toFixed(size >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
+type BackendErrorItem = {
+  msg?: string;
+  message?: string;
+  detail?: string;
+};
+
+async function getResponseError(response: Response) {
+  try {
+    const data = (await response.json()) as {
+      detail?: string | BackendErrorItem[];
+    };
+
+    if (typeof data.detail === "string") {
+      return data.detail;
+    }
+
+    if (Array.isArray(data.detail)) {
+      return data.detail
+        .map((item: BackendErrorItem) => {
+          return item.msg || item.message || item.detail || String(item);
+        })
+        .join("; ");
+    }
+  } catch {
+    // response body is not JSON
+  }
+
+  return `Ошибка сервера: ${response.status}`;
+}
+
+function mapBackendResultToFrontend(data: BackendAnalyzeResponse): AnalyzeResponse {
+  const documentName = data.filename || "document.txt";
+  const backendEntities = data.entities || [];
+  const backendRelations = data.relations || [];
+  const tags = data.tags || [];
+
+  const entityTitleById = new Map(
+    backendEntities.map((entity) => [entity.id, entity.title])
+  );
+
+  const entities: Entity[] = backendEntities.map((entity) => ({
+    id: entity.id,
+    type: entity.type || "Другое",
+    title: entity.title,
+    description: entity.description || "",
+    source: documentName,
+  }));
+
+  const relations: Relation[] = backendRelations.map((relation, index) => ({
+    id: `rel-${index + 1}`,
+    from: entityTitleById.get(relation.source) || relation.source,
+    relation: relation.type || "связано с",
+    to: entityTitleById.get(relation.target) || relation.target,
+  }));
+
+  return {
+    document: {
+      id: `doc-${Date.now()}`,
+      name: documentName,
+      type: documentName.split(".").pop()?.toUpperCase() || "TXT",
+      uploadedAt: "Только что",
+    },
+    entities,
+    relations,
+    graph: {
+      nodes: entities.map((entity) => ({
+        id: entity.id,
+        label: entity.title,
+        group: entity.type,
+      })),
+      links: backendRelations.map((relation) => ({
+        source: relation.source,
+        target: relation.target,
+        label: relation.type || "связано с",
+      })),
+    },
+    tags,
+  };
+}
+
 function App() {
   const [activePage, setActivePage] = useState<Page>("home");
   const [processedFiles, setProcessedFiles] =
     useState<ProcessedFile[]>(initialFiles);
-  const [analysisResult, setAnalysisResult] = useState<AnalyzeResponse | null>(
-    mockAnalyzeResponse
-  );
+  const [analysisResult, setAnalysisResult] =
+    useState<AnalyzeResponse | null>(mockAnalyzeResponse);
   const [text, setText] = useState(demoText);
   const [fileName, setFileName] = useState("");
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
@@ -311,7 +431,6 @@ function App() {
 
   const filteredEntities = currentEntities.filter((entity) => {
     const matchesType = entityFilter === "Все" || entity.type === entityFilter;
-
     return matchesType;
   });
 
@@ -350,10 +469,11 @@ function App() {
 
     if (!file) return;
 
+    setSelectedFile(file);
     setFileName(file.name);
     setErrorMessage("");
 
-    const readableFile = /\.(txt|md|csv|puml)$/i.test(file.name);
+    const readableFile = /\.(txt|md|csv)$/i.test(file.name);
 
     if (!readableFile) {
       setText(
@@ -376,7 +496,8 @@ function App() {
   };
 
   const handleUseDemoCorpus = () => {
-    setFileName("demo-corpus.zip");
+    setSelectedFile(null);
+    setFileName("demo-corpus.txt");
     setText(demoText);
     setErrorMessage("");
   };
@@ -384,6 +505,7 @@ function App() {
   const handleClearUpload = () => {
     setText("");
     setFileName("");
+    setSelectedFile(null);
     setErrorMessage("");
     setIsProcessing(false);
     setIsCopied(false);
@@ -393,10 +515,10 @@ function App() {
     }
   };
 
-  const handleProcess = () => {
+  const handleProcess = async () => {
     const preparedText = normalizeText(text);
 
-    if (!fileName && preparedText.length < 20) {
+    if (!selectedFile && preparedText.length < 20) {
       setErrorMessage("Загрузите файл или вставьте более полный фрагмент текста.");
       return;
     }
@@ -404,18 +526,37 @@ function App() {
     setIsProcessing(true);
     setErrorMessage("");
 
-    setTimeout(() => {
-      const documentName = fileName || "manual-input.txt";
+    try {
+      let response: Response;
 
-      const result: AnalyzeResponse = {
-        ...mockAnalyzeResponse,
-        document: {
-          id: `doc-${Date.now()}`,
-          name: documentName,
-          type: documentName.split(".").pop()?.toUpperCase() || "TXT",
-          uploadedAt: "Сегодня, 16:58",
-        },
-      };
+      if (selectedFile) {
+        const formData = new FormData();
+        formData.append("file", selectedFile);
+
+        response = await fetch(`${API_URL}/api/analyze`, {
+          method: "POST",
+          body: formData,
+        });
+      } else {
+        response = await fetch(`${API_URL}/api/analyze-text`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            text: preparedText,
+            filename: fileName || "manual-input.txt",
+          }),
+        });
+      }
+
+      if (!response.ok) {
+        throw new Error(await getResponseError(response));
+      }
+
+      const backendResult = (await response.json()) as BackendAnalyzeResponse;
+      const result = mapBackendResultToFrontend(backendResult);
+      const documentName = result.document.name;
 
       const newFile: ProcessedFile = {
         id: `file-${Date.now()}`,
@@ -424,7 +565,7 @@ function App() {
         year: new Date().getFullYear(),
         geography: "Россия",
         status: "Обработан",
-        size: "—",
+        size: selectedFile ? formatFileSize(selectedFile.size) : "—",
         entities: result.entities.length,
         relations: result.relations.length,
         uploadedAt: "Только что",
@@ -432,9 +573,17 @@ function App() {
 
       setAnalysisResult(result);
       setProcessedFiles((prev) => [newFile, ...prev].slice(0, 6));
-      setIsProcessing(false);
+      setEntityFilter("Все");
       setActivePage("graph");
-    }, 900);
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error
+          ? error.message
+          : "Не удалось отправить файл на сервер."
+      );
+    } finally {
+      setIsProcessing(false);
+    }
   };
 
   const handleExportJson = () => {
@@ -443,7 +592,6 @@ function App() {
     const blob = new Blob([JSON.stringify(exportData, null, 2)], {
       type: "application/json",
     });
-
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
 
@@ -569,7 +717,6 @@ function App() {
             <button className="primary" onClick={() => setActivePage("upload")}>
               ⇧ Загрузить данные
             </button>
-
             <button className="secondary" onClick={() => setActivePage("search")}>
               ⌕ Открыть навигатор
             </button>
@@ -581,7 +728,6 @@ function App() {
         {dashboardStats.map((stat) => (
           <article className="kpi-card" key={stat.label}>
             <div className="kpi-icon">{stat.icon}</div>
-
             <div>
               <span>{stat.label}</span>
               <b>{stat.value.toLocaleString("ru-RU")}</b>
@@ -600,7 +746,6 @@ function App() {
             {processedFiles.slice(0, 3).map((file) => (
               <div className="activity-item" key={file.id}>
                 <div className="activity-icon">▤</div>
-
                 <div>
                   <b>Загружен документ: «{file.name}»</b>
                   <p>
@@ -608,7 +753,6 @@ function App() {
                     {file.relations}
                   </p>
                 </div>
-
                 <span>{file.uploadedAt}</span>
               </div>
             ))}
@@ -667,25 +811,25 @@ function App() {
             tabIndex={0}
           >
             <div className="dropzone-icon">⇧</div>
-
             <div>
               <b>Перетащите файлы сюда или выберите на компьютере</b>
-              <p>Поддерживаемые форматы: PDF, DOCX, TXT, CSV, XLSX, PUML</p>
-              <button className="outline-button">Выбрать файлы</button>
+              <p>Поддерживаемые форматы: PDF, DOCX, TXT, CSV, MD</p>
+              <button className="outline-button" type="button">
+                Выбрать файлы
+              </button>
             </div>
 
             <input
               ref={fileInputRef}
               className="hidden-file-input"
               type="file"
-              accept=".txt,.md,.csv,.puml,.pdf,.doc,.docx,.xlsx"
+              accept=".pdf,.docx,.txt,.md,.csv"
               onChange={handleFileUpload}
             />
           </div>
 
           <div className="processing-card">
             <div className="processing-icon">⚙</div>
-
             <div>
               <h3>Автоматическая обработка</h3>
               <p>
@@ -712,7 +856,6 @@ function App() {
                   <button className="small-outline-button" onClick={handleCopyJson}>
                     {isCopied ? "Скопировано" : "Скопировать JSON"}
                   </button>
-
                   <button className="small-outline-button" onClick={handleExportJson}>
                     Скачать JSON
                   </button>
@@ -772,12 +915,10 @@ function App() {
                     <td>{file.geography}</td>
                     <td>
                       <span className="status-success">✓ {file.status}</span>
-                      <small>{file.uploadedAt}</small>
+                      <span>{file.uploadedAt}</span>
                     </td>
                     <td>
-                      <span className="mini-metrics">
-                        ⬡ {file.entities} · ↗ {file.relations}
-                      </span>
+                      ⬡ {file.entities} · ↗ {file.relations}
                     </td>
                   </tr>
                 ))}
@@ -786,7 +927,7 @@ function App() {
           </div>
         </article>
 
-        <article className="panel">
+        <article className="panel result-card">
           <div className="panel-header">
             <h2>Результат обработки</h2>
           </div>
@@ -883,7 +1024,7 @@ function App() {
             {entityTypes.map((type) => (
               <button
                 key={type}
-                className={entityFilter === type ? "chip active" : "chip"}
+                className={entityFilter === type ? "active" : ""}
                 onClick={() => setEntityFilter(type)}
               >
                 {type}
@@ -916,7 +1057,6 @@ function App() {
         target: "upload" as Page,
         badge: file.status,
       })),
-
       ...currentEntities.map((entity) => ({
         type: entity.type,
         title: entity.title,
@@ -925,7 +1065,6 @@ function App() {
         badge: entity.source || "Карта знаний",
         filter: entity.type,
       })),
-
       ...(analysisResult?.tags || []).map((tag) => ({
         type: "Тег",
         title: tag,
@@ -933,7 +1072,6 @@ function App() {
         target: "analytics" as Page,
         badge: "Таксономия",
       })),
-
       ...analyticsCoverage.map((item) => ({
         type: "Направление",
         title: item.title,
@@ -975,14 +1113,14 @@ function App() {
 
           <div className="search-input-row">
             <span>⌕</span>
-
             <input
               value={searchQuery}
               onChange={(event) => setSearchQuery(event.target.value)}
               placeholder="Например: титан, эксперимент, прочность, гидрометаллургия..."
             />
-
-            {searchQuery && <button onClick={() => setSearchQuery("")}>×</button>}
+            {searchQuery && (
+              <button onClick={() => setSearchQuery("")}>×</button>
+            )}
           </div>
 
           <div className="navigator-chips">
@@ -999,72 +1137,53 @@ function App() {
               </button>
             ))}
           </div>
-        </section>
 
-        <section className="navigator-layout">
-          <article className="panel">
-            <div className="panel-header">
-              <div>
-                <h2>Результаты навигации</h2>
-                <p>Найдено объектов: {filteredItems.length}</p>
-              </div>
-            </div>
+          <div className="panel-header">
+            <h2>Результаты навигации</h2>
+            <p>Найдено объектов: {filteredItems.length}</p>
+          </div>
 
-            <div className="navigator-list">
-              {filteredItems.map((item) => (
-                <button
-                  className="navigator-item"
-                  key={`${item.type}-${item.title}`}
-                  onClick={() => openNavigationItem(item)}
-                >
-                  <div>
-                    <span>{item.type}</span>
-                    <b>{item.title}</b>
-                    <p>{item.description}</p>
-                  </div>
-
-                  <em>{item.badge}</em>
-                </button>
-              ))}
-            </div>
+          <div className="navigator-results">
+            {filteredItems.map((item) => (
+              <button
+                className="navigator-item"
+                key={`${item.type}-${item.title}-${item.badge}`}
+                onClick={() => openNavigationItem(item)}
+              >
+                <span>{item.type}</span>
+                <b>{item.title}</b>
+                <p>{item.description}</p>
+                <em>{item.badge}</em>
+              </button>
+            ))}
 
             {filteredItems.length === 0 && (
-              <div className="navigator-empty">
+              <div className="empty-state">
                 Ничего не найдено. Попробуйте другой запрос.
               </div>
             )}
+          </div>
+        </section>
+
+        <section className="quick-links">
+          <article onClick={() => setActivePage("upload")}>
+            <b>⇧ Загрузка данных</b>
+            <p>Файлы, обработка и результаты импорта</p>
           </article>
 
-          <article className="panel">
-            <div className="panel-header">
-              <h2>Быстрые переходы</h2>
-            </div>
+          <article onClick={() => setActivePage("graph")}>
+            <b>✣ Карта знаний</b>
+            <p>Граф сущностей и связей</p>
+          </article>
 
-            <div className="quick-nav-grid">
-              <button onClick={() => setActivePage("upload")}>
-                <span>⇧</span>
-                <b>Загрузка данных</b>
-                <p>Файлы, обработка и результаты импорта</p>
-              </button>
+          <article onClick={() => setActivePage("analytics")}>
+            <b>▥ Аналитика</b>
+            <p>Покрытие, риски и активность</p>
+          </article>
 
-              <button onClick={() => setActivePage("graph")}>
-                <span>✣</span>
-                <b>Карта знаний</b>
-                <p>Граф сущностей и связей</p>
-              </button>
-
-              <button onClick={() => setActivePage("analytics")}>
-                <span>▥</span>
-                <b>Аналитика</b>
-                <p>Покрытие, риски и активность</p>
-              </button>
-
-              <button onClick={() => setSearchQuery("Тег")}>
-                <span>#</span>
-                <b>Теги</b>
-                <p>Темы и классификация документов</p>
-              </button>
-            </div>
+          <article onClick={() => setSearchQuery("Тег")}>
+            <b># Теги</b>
+            <p>Темы и классификация документов</p>
           </article>
         </section>
       </>
@@ -1086,8 +1205,7 @@ function App() {
           { label: "Темы риска", value: 3, icon: "!" },
         ].map((stat) => (
           <article className="kpi-card" key={stat.label}>
-            <div className="kpi-icon warning-icon">{stat.icon}</div>
-
+            <div className="kpi-icon">{stat.icon}</div>
             <div>
               <span>{stat.label}</span>
               <b>{stat.value}</b>
@@ -1105,13 +1223,12 @@ function App() {
           <div className="coverage-list">
             {analyticsCoverage.map((item) => (
               <div key={item.title}>
-                <div className="coverage-head">
+                <div>
                   <span>{item.title}</span>
                   <b>{item.value}%</b>
                 </div>
-
                 <div className="progress">
-                  <div style={{ width: `${item.value}%` }}></div>
+                  <span style={{ width: `${item.value}%` }}></span>
                 </div>
               </div>
             ))}
@@ -1142,11 +1259,6 @@ function App() {
             {teamActivity.map((team) => (
               <div key={team.team}>
                 <span>{team.team}</span>
-
-                <div>
-                  <div style={{ width: `${team.value * 2}%` }}></div>
-                </div>
-
                 <b>{team.value}</b>
               </div>
             ))}
@@ -1158,7 +1270,7 @@ function App() {
             <h2>Сравнение практик</h2>
           </div>
 
-          <div className="comparison-table">
+          <div className="comparison-list">
             {[
               ["Покрытие тем", "56%", "74%", "-18 п.п."],
               ["Средний год источников", "2016", "2021", "-5 лет"],
@@ -1179,15 +1291,11 @@ function App() {
   );
 
   return (
-    <div
-      className={
-        isSidebarCollapsed ? "app-shell sidebar-collapsed" : "app-shell"
-      }
-    >
+    <div className={isSidebarCollapsed ? "app sidebar-collapsed" : "app"}>
       <aside className="sidebar">
         <div className="brand">
           <img src="/yarn-ball.png" alt="Научный клубок" />
-          <b>Научный клубок</b>
+          <span>Научный клубок</span>
         </div>
 
         <nav>
@@ -1198,7 +1306,7 @@ function App() {
               onClick={() => setActivePage(page.key)}
             >
               <span>{page.icon}</span>
-              {page.label}
+              <span>{page.label}</span>
             </button>
           ))}
         </nav>
@@ -1211,7 +1319,7 @@ function App() {
         </button>
       </aside>
 
-      <main className="main-area">
+      <main className="content">
         {renderTopbar()}
 
         {activePage === "home" && renderHome()}
